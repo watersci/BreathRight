@@ -633,7 +633,7 @@ write.csv(
 
 ```
 
-
+Lastly, we need this to generate a file that saves our place in time so that the next QA QC report only looks at new data not the data here.
 ```{r}
 current_ranges <- all_data %>%
   group_by(site_id) %>%
@@ -644,10 +644,10 @@ current_ranges <- all_data %>%
     .groups       = "drop"
   )
 
-# 2. Path to your persistent CSV
+# Path to your persistent CSV
 ranges_file <- "site_date_ranges.csv"
 
-# 3. Append or create the CSV
+# Append or create the CSV
 if (file.exists(ranges_file)) {
   # read existing and bind
   existing <- read_csv(ranges_file,
