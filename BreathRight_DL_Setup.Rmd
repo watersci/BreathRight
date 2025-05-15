@@ -1,0 +1,669 @@
+---
+title: "BreathRight_Setup"
+author: "TJM"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+Load in the Data, this is written so that we can download the whole google drive all at once and use this same code every time.
+```{r}
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(officer)
+library(flextable)
+library(glue)
+library(purrr)
+library(readxl)
+library(leaflet)
+
+base_dir <- "data/Sensor_Lists/PurpleAirData/PurpleAirData_2024"
+
+# List all CSV files, capturing the path elements
+all_csvs <- list.files(
+  path       = base_dir,
+  pattern    = "\\.csv$",
+  recursive  = TRUE,
+  full.names = TRUE
+)
+
+# Parse out the site code from the relative path:
+#    e.g. "SITE123/MiscfolderA/data1.csv" => "SITE123"
+
+csv_info <- tibble(
+  full_path = all_csvs
+) %>%
+  # drop the base_dir prefix, split on "/"
+  mutate(rel_path = str_remove(full_path, paste0("^", base_dir, "/"))) %>%
+  separate(rel_path,
+           into = c("site_id", "misc_folder", "filename"),
+           sep  = "/",
+           fill = "right")  # in case there’s no misc_folder
+
+# Read & bind, adding site_id as a column
+all_data <- csv_info %>%
+  # read each file, keep site_id
+  mutate(data = map(full_path, ~ read_csv(.x))) %>%
+  select(site_id, data) %>%
+  unnest(data)
+
+# Now `all_data` is one big tibble with a column `site_id`, 
+# plus all the columns from every CSV.
+
+# the rest of this chunk is written so that we can use the same code next cycle. it looks to see what was run last QAQC report and omits that here 
+
+# load in what was already QC'ed
+updated <- read.csv("~/R_Projects/BreathRight/site_date_ranges.csv",
+                    stringsAsFactors = FALSE
+)
+
+# Convert the three columns to Date
+updated$start_date    <- as.Date(updated$start_date)
+updated$end_date      <- as.Date(updated$end_date)
+updated$reported_date <- as.Date(updated$reported_date)
+
+site_ranges <- updated %>%
+  arrange(site_id, desc(reported_date)) %>%
+  group_by(site_id) %>%
+  slice_head(n = 1) %>%
+  ungroup()
+
+# Truncate your main data by site‐specific windows
+all_data_trunc <- all_data %>%
+  left_join(site_ranges, by = "site_id") %>%
+  filter(
+    (time_stamp >= end_date+1)
+    | is.na(start_date)  # keeps sites not yet in site_ranges
+  ) %>%
+  select(-start_date, -end_date, -reported_date)
+
+archive_full_dat = all_data
+all_data = all_data_trunc 
+
+```
+
+Site Summaries, this is for the tables and figures that go in the introduction. It is useful becuase it will automate the counting of readings and sites.
+```{r}
+# Define your analytes and their column names
+analytes <- list(
+  "PM₂.₅"       = "pm2.5_cf_1",
+  "PM₁₀"        = "pm10.0_cf_1",
+  "Humidity"    = "humidity",
+  "Temperature" = "temperature",
+  "Pressure"    = "pressure",
+  "VOC"         = "voc"
+)
+
+# Compute date range
+date_info <- all_data %>%
+  summarise(
+    start = min(as_date(time_stamp), na.rm = TRUE),
+    end   = max(as_date(time_stamp), na.rm = TRUE)
+  )
+start_date <- format(date_info$start, "%Y-%m-%d")
+end_date   <- format(date_info$end,   "%Y-%m-%d")
+
+# Count unique sites
+n_sites <- all_data %>% distinct(site_id) %>% nrow()
+n_sites_fmt <- prettyNum(n_sites, big.mark = ",")
+
+# Summarize each analyte with formatted numbers
+analyte_summaries <- map_chr(names(analytes), function(an) {
+  col <- analytes[[an]]
+  per_site <- all_data %>%
+    filter(!is.na(.data[[col]])) %>%
+    count(site_id, name = "n")
+  
+  total   <- sum(per_site$n)
+  min_n   <- min(per_site$n)
+  max_n   <- max(per_site$n)
+  
+  glue(
+    "{an}: {prettyNum(total, big.mark = ',')} total ",
+    "(range {prettyNum(min_n, big.mark = ',')}–",
+    "{prettyNum(max_n, big.mark = ',')} per site)"
+  )
+})
+
+# Build the paragraph
+summary_paragraph <- glue(
+  "Data were collected from {n_sites_fmt} sites between {start_date} and {end_date}. ",
+  "Across analytes, measurement totals and per‐site ranges were as follows: ",
+  "{paste(analyte_summaries, collapse = '; ')}."
+)
+
+# 6. Print it out
+cat(summary_paragraph)
+
+```
+
+Now we need a table exported into Word that counts the number of readings for each site & parameter pair.
+```{r}
+colnames(all_data)[colnames(all_data) %in% c("pm2.5_cf_1", "pm10.0_cf_1", "humidity", "temperature", "pressure", "voc")]
+
+analytes <- c(
+  "PM₂.₅ Count"       = "pm2.5_cf_1",
+  "PM₁₀ Count"        = "pm10.0_cf_1",
+  "Humidity Count"    = "humidity",
+  "Temperature Count" = "temperature",
+  "Pressure Count"    = "pressure",
+  "VOC Count"         = "voc"
+)
+
+# Extract just the column names into a character vector
+analyte_cols <- unname(analytes)
+print(analyte_cols)
+
+site_dates <- all_data %>%
+  group_by(site_id) %>%
+  summarise(
+    Start = min(as_date(time_stamp), na.rm = TRUE),
+    End   = max(as_date(time_stamp), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(site_dates)
+
+site_counts <- all_data %>%
+  group_by(site_id) %>%
+  summarise(
+    across(
+      .cols  = all_of(analyte_cols),
+      .fns   = ~ sum(!is.na(.x)),
+      .names = "{.col}_count"
+    ),
+    .groups = "drop"
+  )
+
+print(site_counts)
+
+site_summary_raw <- site_dates %>%
+  left_join(site_counts, by = "site_id")
+
+print(site_summary_raw)
+
+site_summary <- site_summary_raw %>%
+  rename_with(
+    .cols = ends_with("_count"),
+    .fn   = ~ names(analytes)[match(
+      sub("_count$", "", .x),           # drop suffix to match analytes values
+      analytes
+    )]
+  ) %>%
+  rename(Site = site_id)
+
+print(site_summary)
+
+doc <- read_docx()
+
+# 2. Build and style the flextable
+ft <- flextable(site_summary) %>%
+  set_header_labels(
+    Site             = "Site",
+    Start            = "Start Date",
+    End              = "End Date",
+    `PM₂.₅ Count`    = "PM₂.₅ Count",
+    `PM₁₀ Count`     = "PM₁₀ Count",
+    `Humidity Count` = "Humidity Count",
+    `Temperature Count` = "Temperature Count",
+    `Pressure Count` = "Pressure Count",
+    `VOC Count`      = "VOC Count"
+  ) %>%
+  theme_vanilla() %>%
+  autofit()
+
+# Add a title and the table to the document
+doc <- doc %>%
+  body_add_par("Table X. Data Collection Summary by Site", style = "heading 1") %>%
+  body_add_flextable(ft)
+
+# Save the Word file
+print(doc, target = paste0(Sys.Date(),"_data_collection_summary.docx"))
+
+```
+
+Site locations so we can make a site map, this will be in the Viewer of RStudio so take a screenshot to move it to the report.
+```{r}
+# Load the Excel file 
+site_coords <- read_excel(
+  path      = "data/Sensor_Lists/Site_Coordinates.xlsx",
+  sheet     = "Sheet1",
+  col_types = c(
+    "text",     # Sensor
+    "text",     # PS_ID
+    "text",     # Location
+    "text",     # Type
+    "numeric",  # Latitude
+    "numeric"   # Longitude
+  )
+)
+
+# Clean the data
+site_coords_clean <- site_coords %>%
+  filter(!is.na(Sensor), Sensor != "NA") %>%
+  filter(Location != "NOT INSTALLED") %>%
+  select(-PS_ID)
+
+# Prepare flextable, formatting Lat/Lon to show full precision
+ft <- flextable(site_coords_clean) %>%
+  # assume Latitude and Longitude are named exactly as such
+  colformat_double(
+    j      = c("Latitude", "Longitude"),
+    digits = 7   # or however many decimal places you need
+  ) %>%
+  theme_vanilla() %>%
+  autofit()
+
+# Export to Word
+doc <- read_docx() %>%
+  body_add_par("Table Y. Site Coordinates and Sensor Status", style = "heading 1") %>%
+  body_add_flextable(ft)
+
+print(doc, target = paste0(Sys.Date(),"_site_coordinates_summary.docx"))
+
+
+# Define a color palette for Indoor vs. Outdoor
+# 1. Apply jitter to all points (±0.0002°)
+set.seed(1234)
+site_jittered <- site_coords_clean %>%
+  mutate(
+    Latitude_j  = Latitude  + runif(n(), -0.0002, 0.0002),
+    Longitude_j = Longitude + runif(n(), -0.0002, 0.0002)
+  )
+
+# Define a color palette
+pal <- colorFactor(c("blue","red"), domain = c("Indoor", "Outdoor"))
+
+# Compute bounding box
+bounds <- site_coords_clean %>%
+  summarise(
+    min_lon = min(Longitude, na.rm = TRUE),
+    max_lon = max(Longitude, na.rm = TRUE),
+    min_lat = min(Latitude,  na.rm = TRUE),
+    max_lat = max(Latitude,  na.rm = TRUE)
+  )
+
+# Extract the (full‐precision) numeric values
+lng1 <- bounds$min_lon
+lat1 <- bounds$min_lat
+lng2 <- bounds$max_lon
+lat2 <- bounds$max_lat
+
+
+leaflet(site_jittered) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  fitBounds(lng1, lat1, lng2, lat2) %>% 
+  addCircleMarkers(
+    lng       = ~Longitude_j,
+    lat       = ~Latitude_j,
+    color     = ~pal(Type),
+    fill      = TRUE,
+    fillOpacity = 0.8,
+    radius    = 5,
+    stroke    = FALSE,
+    label     = ~Sensor,
+    popup     = ~paste0(
+      "<strong>Sensor:</strong> ", Sensor, "<br/>",
+      "<strong>Type:</strong> ", Type, "<br/>",
+      "<strong>Location:</strong> ", Location
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal      = pal,
+    values   = ~Type,
+    title    = "Sensor Type"
+  )
+
+```
+
+
+We assessed sensor data quality to ensure our analyses rested on reliable measurements. Any drift or malfunction in the optical counters could bias our air-quality estimates. PurpleAir outdoor sensors are equipped with two independent laser counters—Channel A and Channel B. Each can measure particulates separately and their agreement can be compared to generate a confidence score, flagging any sensor drift or blockage. We excluded all single-channel (indoor) sensors from the A–B agreement checks, since without a B channel there was no frame of reference for detecting sensor drift or optical interference. Only outdoor devices reporting both “_a” and “_b” measurements were evaluated for channel agreement. For those sensors, we computed the absolute difference |A – B| for both calibrated PM₂.₅ (pm2.5_cf_1) and calibrated PM₁₀ (pm10.0_cf_1) at each individual measurement and any measurement with |A – B| > 10 µg/m³ was flagged as unreliable and removed from further analysis. This threshold-based QC ensured we worked only with data from sensors whose dual laser counters remained in close alignment, while preserving valid indoor measurements under their single-channel reporting regime.
+
+This chunk makes a plot of all sites, showing the rejected values through time and prints an overall number for PM rejection.
+```{r}
+
+
+# Identify outdoor vs. indoor (as you already have)
+outdoor_sites <- all_data %>%
+  group_by(site_id) %>%
+  filter(any(!is.na(pm2.5_cf_1_b))) %>%
+  pull(site_id) %>% unique()
+
+outdoor_data <- all_data %>% filter(site_id %in% outdoor_sites)
+indoor_data  <- all_data %>% filter(!site_id %in% outdoor_sites)
+
+# Define QC threshold
+qc_threshold <- 10  # µg/m³
+
+# Compute diffs once
+outdoor_data_diff <- outdoor_data %>%
+  mutate(
+    pm25_diff = abs(pm2.5_cf_1_a   - pm2.5_cf_1_b),
+    pm10_diff = abs(pm10.0_cf_1_a - pm10.0_cf_1_b)
+  )
+
+# Apply QC: keep only “good” outdoor, then recombine
+outdoor_qc <- outdoor_data_diff %>%
+  filter(pm25_diff <= qc_threshold, pm10_diff <= qc_threshold) %>%
+  select(-pm25_diff, -pm10_diff)
+
+clean_data <- bind_rows(outdoor_qc, indoor_data)
+
+dropped <- nrow(outdoor_data) - nrow(outdoor_qc)
+message(dropped, " outdoor readings removed by QC; indoor data retained as-is.")
+
+# Summarize rejects by site
+rejected_by_site <- outdoor_data_diff %>%
+  filter(pm25_diff > qc_threshold | pm10_diff > qc_threshold) %>%
+  group_by(site_id) %>%
+  summarise(
+    rejected_count = n(),
+    total_outdoor   = n_distinct(outdoor_data$time_stamp[outdoor_data$site_id==site_id]),
+    rejection_rate  = round((rejected_count / total_outdoor)*100,2)
+  ) %>%
+  arrange(desc(rejected_count))
+
+print(rejected_by_site)
+
+# Prepare time‐series of rejects
+rejected_time <- outdoor_data_diff %>%
+  filter(pm25_diff > qc_threshold | pm10_diff > qc_threshold) %>%
+  mutate(date = as_date(time_stamp)) %>%
+  group_by(site_id, date) %>%
+  summarise(daily_rejects = n(), .groups = "drop")
+
+# Multi‐panel plot
+p_all <- rejected_time %>%
+  ggplot(aes(x = date, y = daily_rejects)) +
+  geom_col() +
+  facet_wrap(~ site_id, ncol = 2, scales = "free_y") +
+  labs(
+    title = "",
+    x     = "Date",
+    y     = "Number of Daily QA/QC Rejections"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 12),
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.title = element_text(size = 12),
+    axis.text  = element_text(size = 10)
+  )
+
+# Save at 8.5×11 inches (portrait US Letter) for Word
+ggsave(
+  filename = paste0(Sys.Date(),"rejected_readings_by_site.png"),
+  plot     = p_all,
+  width    = 8.5,
+  height   = 11,
+  units    = "in",
+  dpi      = 300
+)
+
+
+
+```
+
+This chunk makes a table in a word file of the PM rejections, totals, and rate of rejection.
+```{r}
+# Recompute diffs on outdoor sensors once
+outdoor_data_diff <- all_data %>%
+  filter(!is.na(pm2.5_cf_1_b)) %>%   # only outdoor
+  mutate(
+    pm25_diff = abs(pm2.5_cf_1_a   - pm2.5_cf_1_b),
+    pm10_diff = abs(pm10.0_cf_1_a - pm10.0_cf_1_b)
+  )
+
+# Compute site‐level stats for both pollutants
+site_stats <- outdoor_data_diff %>%
+  group_by(site_id) %>%
+  summarise(
+    pm25_failed = sum(pm25_diff > qc_threshold, na.rm = TRUE),
+    pm25_total  = n(),
+    pm25_rate   = pm25_failed  / pm25_total  * 100,
+    pm10_failed = sum(pm10_diff > qc_threshold, na.rm = TRUE),
+    pm10_total  = n(),
+    pm10_rate   = pm10_failed  / pm10_total  * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pm25_failed + pm10_failed))
+
+# Compute overall data period
+date_range <- all_data %>%
+  summarise(
+    start = min(as_date(time_stamp), na.rm = TRUE),
+    end   = max(as_date(time_stamp), na.rm = TRUE)
+  ) %>%
+  transmute(label = paste0("Data period: ", start, " to ", end)) %>%
+  pull(label)
+
+# Build the Word document and flextable
+doc <- read_docx()
+
+ft <- flextable(site_stats) %>%
+  add_header_lines(values = date_range) %>%       # subtitle with date range
+  set_header_labels(
+    site_id      = "Site",
+    pm25_failed  = "PM₂.₅ Failed QC",
+    pm25_total   = "PM₂.₅ Total",
+    pm25_rate    = "PM₂.₅ Rejection Rate (%)",
+    pm10_failed  = "PM₁₀ Failed QC",
+    pm10_total   = "PM₁₀ Total",
+    pm10_rate    = "PM₁₀ Rejection Rate (%)"
+  ) %>%
+  theme_vanilla() %>%
+  autofit()
+
+doc <- doc %>%
+  body_add_par("Rejected Readings by Site", style = "heading 1") %>%
+  body_add_flextable(ft)
+
+# Save to a Word file
+print(doc, target = paste0(Sys.Date(),"_rejected_by_site_summary.docx"))
+
+
+```
+
+We evaluated humidity data quality to ensure our analyses relied on accurate relative‐humidity measurements—any discrepancy between the two onboard humidity sensors could indicate fouling, sensor drift, or environmental interference. Like particulate matter, we excluded single‐channel (indoor) sensors from this check because without a second sensor reading there is no basis for comparison. For outdoor devices reporting both humidity_a and humidity_b, we calculated the absolute difference |A – B| at each timestamp and flagged any reading where |A – B| exceeded 5 % RH as unreliable. Those outliers were removed from further analysis, while all remaining humidity values (including intact indoor measurements) were retained. This approach ensured that only well‐matched dual‐sensor readings informed our humidity assessments.
+
+This chunk only computes how many are rejected, so far this has never happened so there are no plots or tables.
+```{r}
+# 1. Define your humidity QC threshold
+#    A 5 %RH difference between the two laser counters is a common cut‐off
+hum_threshold <- 5
+
+# 2. Identify which sites have any B‐channel humidity readings
+hum_outdoor_sites <- all_data %>%
+  group_by(site_id) %>%
+  filter(any(!is.na(humidity_b))) %>%
+  pull(site_id) %>% unique()
+
+# 3. Split indoor vs. outdoor
+hum_outdoor <- all_data %>% filter(site_id %in% hum_outdoor_sites)
+hum_indoor  <- all_data %>% filter(!site_id %in% hum_outdoor_sites)
+
+# 4. Compute humidity diffs once
+hum_outdoor_diff <- hum_outdoor %>%
+  mutate(hum_diff = abs(humidity_a - humidity_b)) %>% select(hum_diff)
+
+summary(hum_outdoor_diff)
+
+message(
+  length(which(hum_outdoor_diff !=0)),
+  " outdoor humidity readings removed by QC; indoor humidity retained as-is."
+)
+
+
+```
+
+We assessed temperature data quality by comparing the two onboard temperature sensors on each outdoor device—temperature_a versus temperature_b. Any reading where the absolute difference |A – B| exceeded 2 °C was considered unreliable, as such a discrepancy often indicates sensor drift, fouling, or localized micro‐environment effects. Single‐channel (indoor) sensors were exempt from this check. All flagged timestamps were removed, ensuring that downstream analyses rely only on well‐matched dual‐sensor temperature measurements.
+
+This chunk only computes how many are rejected, so far this has never happened so there are no plots or tables.
+```{R}
+
+# 1. Define the QC threshold for temperature
+temp_threshold <- 2  # degrees Celsius
+
+# 2. Identify outdoor sensors with a B-channel
+temp_outdoor_sites <- all_data %>%
+  group_by(site_id) %>%
+  filter(any(!is.na(temperature_b))) %>%
+  pull(site_id) %>% unique()
+
+temp_outdoor <- all_data %>% filter(site_id %in% temp_outdoor_sites)
+temp_indoor  <- all_data %>% filter(!site_id %in% temp_outdoor_sites)
+
+# 3. Compute diffs once
+temp_outdoor_diff <- temp_outdoor %>%
+  mutate(temp_diff = abs(temperature_a - temperature_b)) %>% select(temp_diff)
+
+summary(temp_outdoor_diff)
+
+
+message(
+  length(which(temp_outdoor_diff !=0)),
+  " outdoor temperature readings removed by QC; indoor temperature retained as-is."
+)
+
+```
+
+We evaluated pressure data quality by comparing the two onboard pressure sensors—pressure_a versus pressure_b—on outdoor devices. Any reading where the absolute difference |A – B| exceeded 3 hPa was considered unreliable, as such a discrepancy can signal sensor drift or blockage in the pressure inlets. Single‐channel (indoor) sensors were exempt from this check. Timestamps failing this criterion were removed, ensuring that only well‐matched dual‐sensor pressure measurements were used in subsequent analyses.
+
+This chunk only computes how many are rejected, so far this has never happened so there are no plots or tables.
+```{r}
+
+
+# 1. Set QC threshold for pressure (3 hPa)
+pres_threshold <- 3  
+
+# 2. Identify outdoor vs. indoor sites based on pressure_b
+pres_outdoor_sites <- all_data %>%
+  group_by(site_id) %>%
+  filter(any(!is.na(pressure_b))) %>%
+  pull(site_id) %>% unique()
+
+pres_outdoor <- all_data  %>% filter(site_id %in% pres_outdoor_sites)
+pres_indoor  <- all_data  %>% filter(!site_id %in% pres_outdoor_sites)
+
+# 3. Compute A–B differences once
+pres_outdoor_diff <- pres_outdoor %>%
+  mutate(pres_diff = abs(pressure_a - pressure_b)) %>% select(pres_diff)
+
+summary(pres_outdoor_diff)
+
+message(
+  length(which(temp_outdoor_diff !=0)),
+  " outdoor pressure readings removed by QC; indoor pressure retained as-is."
+)
+
+```
+
+Finally, we assessed VOC data quality. We attempted to apply the same dual‐sensor QA/QC procedure to the VOC measurements, but found that none of our devices report a second channel. Without a paired reading there is no basis for computing an A–B difference, so we were unable to flag outliers by inter‐sensor agreement. Instead, all VOC readings—both indoor and outdoor—were retained intact, and any necessary quality control will rely on instrument calibration records, environmental plausibility checks (e.g. removing negative or implausibly high concentrations), or comparison to collocated reference monitors rather than channel‐to‐channel comparisons.Because our PurpleAir units report only a single VOC channel, we instead performed a range‐based plausibility filter. All VOC measurements below 0 ppb (impossible) or above 10 000 ppb (beyond the sensor’s reliable range) were flagged as invalid and removed. This step eliminated physically nonsensical or saturated readings, ensuring that only plausible VOC concentrations remained for downstream analysis.
+
+This chunk counts the rejected values and makes a histogram of the readings.
+```{r}
+
+any(which(all_data$voc < 0))
+any(which(all_data$voc > 10000))
+
+# in R, using base plotting
+voc_vals <- all_data$voc
+
+png(paste0(Sys.Date(),"_voc_histogram.png"), width=800, height=500)
+hist(
+  voc_vals,
+  breaks = 50,
+  main   = "Distribution of VOC Readings (ppb)",
+  xlab   = "VOC (ppb)",
+  ylab   = "Frequency"
+)
+dev.off()
+
+```
+
+This chunk makes a big CSV of all the data combined, with QAQC flags for export, for use by partners
+```{r}
+# Define thresholds
+pm_threshold   <- 10    # µg/m³ for PM₂.₅ & PM₁₀
+hum_threshold  <- 5     # % RH
+temp_threshold <- 2     # °C
+pres_threshold <- 3     # hPa
+voc_min        <- 0     # ppb
+voc_max        <- 10000 # ppb
+
+# Start from all_data, compute diffs and VOC plausibility
+all_data_flagged <- all_data %>%
+  # Compute dual‐channel diffs (outdoor only; indoor will be NA)
+  mutate(
+    pm25_diff   = abs(pm2.5_cf_1_a   - pm2.5_cf_1_b),
+    pm10_diff   = abs(pm10.0_cf_1_a - pm10.0_cf_1_b),
+    hum_diff    = abs(humidity_a     - humidity_b),
+    temp_diff   = abs(temperature_a  - temperature_b),
+    pres_diff   = abs(pressure_a     - pressure_b),
+    voc_flag    = case_when(
+      is.na(voc)            ~ 6,    # treat missing VOC as flagged
+      voc < voc_min         ~ 6,
+      voc > voc_max         ~ 6,
+      TRUE                  ~ 0
+    ),
+    # Now set QAQC_Flag based on the first failure in priority order:
+    QAQC_Flag = case_when(
+      pm25_diff  > pm_threshold  ~ 1,
+      pm10_diff  > pm_threshold  ~ 2,
+      hum_diff   > hum_threshold ~ 3,
+      temp_diff  > temp_threshold ~ 4,
+      pres_diff  > pres_threshold ~ 5,
+      voc_flag   == 6             ~ 6,
+      TRUE                        ~ 0
+    )
+  ) %>%
+  select(-pm25_diff, -pm10_diff, -hum_diff, -temp_diff, -pres_diff, -voc_flag)
+
+today <- Sys.Date()
+
+# Write to CSV
+write.csv(
+  all_data_flagged,
+  file = paste0(today,"_all_data_with_QAQC_Flag.csv"),
+  row.names = FALSE
+)
+
+
+```
+
+
+```{r}
+current_ranges <- all_data %>%
+  group_by(site_id) %>%
+  summarise(
+    start_date    = min(as_date(time_stamp), na.rm = TRUE),
+    end_date      = max(as_date(time_stamp), na.rm = TRUE),
+    reported_date = today,
+    .groups       = "drop"
+  )
+
+# 2. Path to your persistent CSV
+ranges_file <- "site_date_ranges.csv"
+
+# 3. Append or create the CSV
+if (file.exists(ranges_file)) {
+  # read existing and bind
+  existing <- read_csv(ranges_file,
+                       col_types = cols(
+                         site_id       = col_character(),
+                         start_date    = col_date(),
+                         end_date      = col_date(),
+                         reported_date = col_date()
+                       ))
+  updated <- bind_rows(existing, current_ranges)
+} else {
+  # first time, just use current
+  updated <- current_ranges
+}
+
+write_csv(updated,"site_date_ranges.csv")
+
+
+```
